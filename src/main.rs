@@ -4,7 +4,8 @@
 use cpal::{ Device, Sample };
 use cpal::traits::{ StreamTrait, HostTrait, DeviceTrait };
 use dasp_sample::ToSample;
-use std::sync::{ Arc, Mutex };
+use std::collections::VecDeque;
+use std::sync::{ Arc, Condvar, Mutex };
 use std::thread;
 // use hound;
 /// capture_audio_output - capture the audio stream from the default audio output device
@@ -45,10 +46,15 @@ fn play_test_audio(device: cpal::Device) {
     }
 }
 
-fn play_audio_output(buffer: Arc<Mutex<Vec<f32>>>, devices: Vec<cpal::Device>, sample_rate: u32) {
+fn play_audio_output(
+    buffer: Arc<(Mutex<VecDeque<f32>>, Condvar)>,
+    devices: Vec<cpal::Device>,
+    sample_rate: u32
+) {
     let mut handles = vec![];
     // let samples = Arc::new(f32_samples.clone());
     // let playback_duration = (f32_samples.len() as f32) / (sample_rate as f32);
+    let playback_duration = 10.0; // 20ms
 
     for device in devices {
         let buffer = Arc::clone(&buffer);
@@ -67,25 +73,54 @@ fn play_audio_output(buffer: Arc<Mutex<Vec<f32>>>, devices: Vec<cpal::Device>, s
             let clone_device_name = device_name.clone();
             let err_fn = move |err| eprintln!("Error on {}: {}", clone_device_name, err);
 
-            let mut sample_clock = 0;
-
             let stream = match config.sample_format() {
                 cpal::SampleFormat::F32 => {
                     device.build_output_stream(
                         &config.into(),
                         move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
-                            let mut buffer = buffer.lock().unwrap();
-                            let len = buffer.len();
-
-                            // Process samples in chunks
-                            if len >= data.len() {
-                                data.copy_from_slice(&buffer[..data.len()]);
-                                buffer.drain(..data.len()); // Remove the used samples
+                            let (lock, cvar) = &*buffer;
+                            let mut queue = lock.lock().unwrap();
+                            if queue.len() < data.len() {
+                                // println!(
+                                //     "Underrun: Queue size {} is less than required size {}. Filling with silence.",
+                                //     queue.len(),
+                                //     data.len()
+                                // );
+                                let mut count = 0;
+                                for sample in data.iter_mut() {
+                                    if count < queue.len() {
+                                        *sample = queue.pop_front().unwrap();
+                                    } else {
+                                        *sample = 0.0;
+                                    }
+                                    count += 1;
+                                }
                             } else {
-                                data[..len].copy_from_slice(&buffer); // Use available samples
-                                data[len..].fill(0.0); // Fill the rest with silence
-                                buffer.clear();
+                                // Fill the output buffer with data from the queue
+                                // println!("Filling output buffer with data from the queue");
+                                for sample in data.iter_mut() {
+                                    *sample = queue.pop_front().unwrap();
+                                }
                             }
+                            // while queue.len() < data.len() {
+                            //     println!(
+                            //         "Consumer: Waiting for queue to reach size {},current size {}",
+                            //         data.len(),
+                            //         queue.len()
+                            //     );
+                            //     thread::sleep(std::time::Duration::from_millis(20));
+                            //     queue = cvar.wait(queue).unwrap(); // Wait for the condition
+                            // }
+                            // println!("Consumer: Queue reached size {},{}", data.len(), queue.len());
+                            // let len = data.len();
+                            // for i in 0..len {
+                            //     if let Some(sample) = queue.pop_front() {
+                            //         data[i] = sample;
+                            //     } else {
+                            //         eprintln!("Unexpected empty queue while processing!");
+                            //         data[i] = 0.0;
+                            //     }
+                            // }
                         },
                         err_fn,
                         None
@@ -99,11 +134,15 @@ fn play_audio_output(buffer: Arc<Mutex<Vec<f32>>>, devices: Vec<cpal::Device>, s
 
             if let Ok(stream) = stream {
                 stream.play().expect("Failed to play stream");
-                // println!("Playing samples with f32 format on {}", device_name);
-
                 // Keep the thread running so the stream can play
-                println!("Playing audio for 0.02 seconds on device {}", device_name); // playback_duration,
-                std::thread::sleep(std::time::Duration::from_secs_f32(10.0));
+                println!(
+                    "Playing audio for {} seconds on device {}",
+                    playback_duration,
+                    device_name
+                ); // playback_duration,
+                loop {
+                    std::thread::sleep(std::time::Duration::from_secs(1));
+                }
             }
         });
 
@@ -152,7 +191,7 @@ fn log(message: String) {
 }
 fn capture_output_audio(
     device: &cpal::Device,
-    buffer: Arc<Mutex<Vec<f32>>>
+    buffer: Arc<(Mutex<VecDeque<f32>>, Condvar)>
 ) -> Option<cpal::Stream> {
     log(
         format!(
@@ -160,9 +199,9 @@ fn capture_output_audio(
             device.name().expect("Could not get default audio device name")
         )
     );
-    let mut f32_samples: Vec<f32> = Vec::with_capacity(16384);
+    // let mut f32_samples: Vec<f32> = Vec::with_capacity(16384);
     let audio_cfg = device.default_output_config().expect("No default output config found");
-    let sample_rate = audio_cfg.sample_rate().0;
+    // let sample_rate = audio_cfg.sample_rate().0;
     log(format!("Default audio {:?}", audio_cfg));
 
     let stream = match
@@ -173,12 +212,17 @@ fn capture_output_audio(
                 // wave_reader::<f32>(data, &mut f32_samples.clone(), devices.clone(), sample_rate),
                 {
                     // println!("adding to buffer");
-                    let mut local_data: Vec<f32> = Vec::with_capacity(data.len());
-                    local_data.extend_from_slice(data);
+                    // let mut local_data: Vec<f32> = Vec::with_capacity(data.len());
+                    // local_data.extend_from_slice(data);
+                    // println!("local_data size {}", local_data.len());
 
                     // Append local_data to buffer
-                    let mut buffer = buffer.lock().unwrap();
-                    buffer.extend(local_data);
+                    let (lock, cvar) = &*buffer;
+
+                    let mut queue = lock.lock().unwrap();
+                    queue.extend(data.iter());
+                    // println!("queue size {}", queue.len());
+                    cvar.notify_all();
                 },
             capture_err_fn,
             None
@@ -187,13 +231,11 @@ fn capture_output_audio(
         Ok(stream) => Some(stream),
         Err(e) => {
             log(format!("Error capturing f32 audio stream: {}", e));
-
             None
         }
     };
 
     stream
-
     // match audio_cfg.sample_format() {
     //     cpal::SampleFormat::F32 =>
 
@@ -246,12 +288,35 @@ fn main() {
         .into_iter()
         .filter(|x| x.name().unwrap() != device.name().unwrap())
         .collect::<Vec<Device>>();
-    let buffer: Arc<Mutex<Vec<f32>>> = Arc::new(Mutex::new(Vec::new()));
-    let cloned = Arc::clone(&buffer);
+    println!("Default device: {}", device.name().unwrap());
+    println!("Other devices:");
+    for device in &devices {
+        println!(
+            " - {}",
+            device.name().unwrap_or_else(|_| "Unknown Device".to_string())
+        );
+    }
+    let buffer: Arc<(Mutex<VecDeque<f32>>, Condvar)> = Arc::new((
+        Mutex::new(VecDeque::new()),
+        Condvar::new(),
+    ));
+    let cloned: Arc<(Mutex<VecDeque<f32>>, Condvar)> = Arc::clone(&buffer);
+
+    let mut handles = vec![];
     let stream = capture_output_audio(&device, cloned).expect("No stream found");
     stream.play().expect("Failed to play stream");
-
-    play_audio_output(buffer, devices, 44100);
+    // let handle1 = thread::spawn(move || {});
+    let handle2 = thread::spawn(move || {
+        play_audio_output(buffer, devices, 44100);
+    });
+    // handles.push(handle1);
+    handles.push(handle2);
+    for handle in handles {
+        handle.join().unwrap();
+    }
+    // play_audio_output(buffer, devices, 44100);
     // play_test_audio(device);
-    std::thread::sleep(std::time::Duration::from_secs(5));
+    loop {
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
 }
