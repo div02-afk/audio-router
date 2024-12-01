@@ -4,8 +4,10 @@
 use cpal::{ Device, Sample };
 use cpal::traits::{ StreamTrait, HostTrait, DeviceTrait };
 use dasp_sample::ToSample;
-use std::collections::VecDeque;
-use std::sync::{ Arc, Condvar, Mutex };
+// use std::collections::VecDeque;
+// use std::io::Write;
+use crossbeam::queue::SegQueue;
+use std::sync::Arc;
 use std::thread;
 // use hound;
 /// capture_audio_output - capture the audio stream from the default audio output device
@@ -46,11 +48,7 @@ fn play_test_audio(device: cpal::Device) {
     }
 }
 
-fn play_audio_output(
-    buffer: Arc<(Mutex<VecDeque<f32>>, Condvar)>,
-    devices: Vec<cpal::Device>,
-    sample_rate: u32
-) {
+fn play_audio_output(buffer: Arc<SegQueue<f32>>, devices: Vec<cpal::Device>, sample_rate: u32) {
     let mut handles = vec![];
     // let samples = Arc::new(f32_samples.clone());
     // let playback_duration = (f32_samples.len() as f32) / (sample_rate as f32);
@@ -78,28 +76,28 @@ fn play_audio_output(
                     device.build_output_stream(
                         &config.into(),
                         move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
-                            let (lock, cvar) = &*buffer;
-                            let mut queue = lock.lock().unwrap();
-                            if queue.len() < data.len() {
-                                // println!(
-                                //     "Underrun: Queue size {} is less than required size {}. Filling with silence.",
-                                //     queue.len(),
-                                //     data.len()
-                                // );
+                            // let (lock, cvar) = &*buffer;
+                            // let mut queue = lock.lock().unwrap();
+                            if buffer.len() < data.len() {
+                                println!(
+                                    "Underrun: buffer size {} is less than required size {}. Filling with silence.",
+                                    buffer.len(),
+                                    data.len()
+                                );
                                 let mut count = 0;
                                 for sample in data.iter_mut() {
-                                    if count < queue.len() {
-                                        *sample = queue.pop_front().unwrap();
+                                    if count < buffer.len() {
+                                        *sample = buffer.pop().unwrap();
                                     } else {
                                         *sample = 0.0;
                                     }
                                     count += 1;
                                 }
                             } else {
-                                // Fill the output buffer with data from the queue
-                                // println!("Filling output buffer with data from the queue");
+                                // Fill the output buffer with data from the buffer
+                                println!("Filling output buffer with data from the buffer");
                                 for sample in data.iter_mut() {
-                                    *sample = queue.pop_front().unwrap();
+                                    *sample = buffer.pop().unwrap();
                                 }
                             }
                             // while queue.len() < data.len() {
@@ -155,44 +153,10 @@ fn play_audio_output(
     }
 }
 
-fn wave_reader<T>(
-    samples: &[T],
-    f32_samples: &mut Vec<f32>,
-    devices: Arc<Vec<Device>>,
-    sample_rate: u32
-)
-    where T: Sample + ToSample<f32>
-{
-    f32_samples.clear();
-    f32_samples.extend(samples.iter().map(|x: &T| T::to_sample::<f32>(*x)));
-    // println!("writing to file");
-    // println!("First 10 samples: {:?}", &f32_samples[..10]);
-    // play_audio_output(f32_samples, devices.to_vec(), sample_rate);
-    // let spec = hound::WavSpec {
-    //     channels: 2,
-    //     sample_rate: 44100,
-    //     bits_per_sample: 32,
-    //     sample_format: hound::SampleFormat::Float,
-    // };
-
-    // let mut writer = OpenOptions::new()
-    //     .create(true)
-    //     .write(true)
-    //     .append(true)
-    //     .open("output_audio.wav")
-    //     .expect("Failed to open WAV file");
-
-    // for sample in f32_samples.iter() {
-    //     writer.write_all(&sample.to_ne_bytes()).expect("Failed to write sample");
-    // }
-}
 fn log(message: String) {
     println!("{}", message);
 }
-fn capture_output_audio(
-    device: &cpal::Device,
-    buffer: Arc<(Mutex<VecDeque<f32>>, Condvar)>
-) -> Option<cpal::Stream> {
+fn capture_output_audio(device: &cpal::Device, buffer: Arc<SegQueue<f32>>) -> Option<cpal::Stream> {
     log(
         format!(
             "Capturing audio from: {}",
@@ -217,12 +181,15 @@ fn capture_output_audio(
                     // println!("local_data size {}", local_data.len());
 
                     // Append local_data to buffer
-                    let (lock, cvar) = &*buffer;
+                    // let (lock, cvar) = &*buffer;
 
-                    let mut queue = lock.lock().unwrap();
-                    queue.extend(data.iter());
+                    // let mut queue = lock.lock().unwrap();
+                    // buffer.extend(data.iter());
+                    for sample in data.iter() {
+                        buffer.push(*sample);
+                    }
                     // println!("queue size {}", queue.len());
-                    cvar.notify_all();
+                    // cvar.notify_all();
                 },
             capture_err_fn,
             None
@@ -296,11 +263,12 @@ fn main() {
             device.name().unwrap_or_else(|_| "Unknown Device".to_string())
         );
     }
-    let buffer: Arc<(Mutex<VecDeque<f32>>, Condvar)> = Arc::new((
-        Mutex::new(VecDeque::new()),
-        Condvar::new(),
-    ));
-    let cloned: Arc<(Mutex<VecDeque<f32>>, Condvar)> = Arc::clone(&buffer);
+    let buffer: Arc<SegQueue<f32>> = Arc::new(SegQueue::new());
+    // let buffer: Arc<SegQueue<f32>> = Arc::new((
+    //     Mutex::new(VecDeque::new()),
+    //     Condvar::new(),
+    // ));
+    let cloned: Arc<SegQueue<f32>> = Arc::clone(&buffer);
 
     let mut handles = vec![];
     let stream = capture_output_audio(&device, cloned).expect("No stream found");
